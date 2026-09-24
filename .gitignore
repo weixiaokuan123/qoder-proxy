@@ -1,0 +1,30 @@
+﻿# 运行时生成的本地鉴权 key（含个人 bearer key，绝不入库）
+keys/*.key
+
+# 运行时状态：签到计划（含账号标识），绝不入库
+state/
+
+# 运行时日志 / pid
+logs/*
+!logs/.gitkeep
+
+# 本机 opencode 配置备份（可能含个人 provider / 端点信息）
+opencode.jsonc.bak*
+*.bak.qoder
+
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 环境变量
+.env
+.env.*
