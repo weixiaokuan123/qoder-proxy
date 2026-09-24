@@ -21,6 +21,10 @@ npm-debug.log*
 pnpm-debug.log*
 yarn-error.log*
 
+# 内嵌的 qodercli 运行时：装到 vendor/，依赖体积大不入库，只留清单
+vendor/node_modules/
+vendor/package-lock.json
+
 # 编辑器 / 系统
 .vscode/
 .idea/

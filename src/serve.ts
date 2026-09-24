@@ -1,18 +1,23 @@
 /**
  * qoder-proxy HTTP 服务。
  *
- * 与另外三个代理不同，Qoder 的模型推理走 CLI 的 SDK 私协议（不是公开 REST），
- * 因此本服务**不提供** OpenAI/Anthropic 兼容的推理入口，只提供管理面：
+ * 管理面（REST，直接读桌面端登录态）：
  *
  *   GET  /health              存活探针
  *   GET  /status              全区域概览：账号、套餐、额度、签到状态
- *   GET  /usage?region=cn    单区域额度明细
- *   GET  /signin?region=cn   单区域签到状态
- *   POST /signin/claim       立即执行签到（全部区域或指定 region）
- *   GET  /schedule           今日签到计划时刻（各区域）
+ *   GET  /usage?region=cn     单区域额度明细
+ *   GET  /signin?region=cn    单区域签到状态
+ *   POST /signin/claim        立即执行签到（全部区域或指定 region）
+ *   GET  /schedule            今日签到计划时刻（各区域）
+ *
+ * 推理面（走官方 qodercli 子进程，见 src/cli.ts）：
+ *
+ *   GET  /cli/status                 qodercli 安装/登录/可用模型/并发占用
+ *   POST /v1/chat/completions        OpenAI 兼容推理入口
  *
  * 账号来源是**桌面端登录态**（只读 `auth.v1.dat`），不做账号池、不做端口分账号
  * —— Qoder 桌面端同一区域只保留一份登录态，多账号需要用户自行在客户端切换。
+ * 推理面用的是 qodercli 自己的登录态（`qodercli login`），与桌面端凭据相互独立。
  *
  * @module qoder-proxy/serve
  */
@@ -20,6 +25,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 
 import { defaultLayout, describeExpiry, probeCredential, type QoderRegion } from './auth.ts'
+import { cliConcurrency, isCliAvailable, probeCli, runCli } from './cli.ts'
 import { QoderSigninService } from './signin.ts'
 import { QoderUpstreamClient, QoderUpstreamError } from './upstream.ts'
 import { QODER_PROXY_VERSION } from './version.ts'
@@ -167,6 +173,63 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text)
 }
 
+/** 读取并解析请求体（限 1MB）。 */
+async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buf = chunk as Buffer
+    size += buf.length
+    if (size > 1_048_576) throw new Error('请求体超过 1MB 上限')
+    chunks.push(buf)
+  }
+  if (chunks.length === 0) return {}
+  const raw = Buffer.concat(chunks).toString('utf8').trim()
+  if (!raw) return {}
+  const parsed: unknown = JSON.parse(raw)
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('请求体必须是 JSON 对象')
+  }
+  return parsed as Record<string, unknown>
+}
+
+/**
+ * 把 OpenAI 风格的 messages 拍平成单段提示词。
+ *
+ * qodercli 是 agent 而非无状态补全接口，没有 system/user/assistant 角色概念，
+ * 因此这里把历史对话拼成带角色标注的纯文本，交给 CLI 当作一次任务提示。
+ */
+function flattenMessages(messages: unknown): string {
+  if (!Array.isArray(messages)) return ''
+  const parts: string[] = []
+  for (const m of messages) {
+    if (typeof m !== 'object' || m === null) continue
+    const item = m as { role?: unknown; content?: unknown }
+    const role = typeof item.role === 'string' ? item.role : 'user'
+    let text = ''
+    if (typeof item.content === 'string') {
+      text = item.content
+    } else if (Array.isArray(item.content)) {
+      text = item.content
+        .map(part => {
+          if (typeof part === 'string') return part
+          if (typeof part === 'object' && part !== null) {
+            const p = part as { type?: unknown; text?: unknown }
+            return p.type === 'text' && typeof p.text === 'string' ? p.text : ''
+          }
+          return ''
+        })
+        .filter(Boolean)
+        .join('\n')
+    }
+    if (!text.trim()) continue
+    if (role === 'system') parts.push(`[系统指令]\n${text}`)
+    else if (role === 'assistant') parts.push(`[助手]\n${text}`)
+    else parts.push(text)
+  }
+  return parts.join('\n\n')
+}
+
 export interface ServeOptions {
   port?: number
   host?: string
@@ -305,6 +368,77 @@ export async function startServer(options: ServeOptions = {}): Promise<{ port: n
         }
       }
       sendJson(res, 200, { generatedAt: new Date().toISOString(), results })
+      return
+    }
+
+    if (path === '/cli/status') {
+      const probe = await probeCli()
+      sendJson(res, 200, {
+        installed: probe.installed,
+        available: isCliAvailable(),
+        loggedIn: probe.loggedIn,
+        statusText: probe.statusText,
+        models: probe.models,
+        concurrency: cliConcurrency(),
+        maxConcurrency: Number(process.env['QODER_CLI_MAX_CONCURRENCY'] ?? 2),
+        timeoutMs: Number(process.env['QODER_CLI_TIMEOUT_MS'] ?? 180000),
+      })
+      return
+    }
+
+    if (path === '/v1/chat/completions') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: { message: '请用 POST', type: 'invalid_request_error' } })
+        return
+      }
+
+      let body: Record<string, unknown>
+      try {
+        body = await readJsonBody(req)
+      } catch (error: unknown) {
+        sendJson(res, 400, { error: { message: errorText(error), type: 'invalid_request_error' } })
+        return
+      }
+
+      const prompt = flattenMessages(body['messages'])
+      if (!prompt.trim()) {
+        sendJson(res, 400, {
+          error: { message: 'messages 为空或无可提取文本', type: 'invalid_request_error' },
+        })
+        return
+      }
+
+      const model = typeof body['model'] === 'string' && body['model'] !== '' ? body['model'] : undefined
+      const result = await runCli({ prompt, ...(model !== undefined ? { model } : {}) })
+
+      const created = Math.floor(Date.now() / 1000)
+      if (!result.ok) {
+        sendJson(res, 502, {
+          error: { message: result.error ?? 'qodercli 调用失败', type: 'upstream_error' },
+          qoder: { durationMs: result.durationMs, timedOut: result.timedOut, code: result.code },
+        })
+        return
+      }
+
+      sendJson(res, 200, {
+        id: `chatcmpl-qoder-${created}-${Math.random().toString(36).slice(2, 10)}`,
+        object: 'chat.completion',
+        created,
+        model: model ?? 'qoder-auto',
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: result.text },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: Math.ceil(prompt.length / 4),
+          completion_tokens: Math.ceil(result.text.length / 4),
+          total_tokens: Math.ceil((prompt.length + result.text.length) / 4),
+        },
+        qoder: { durationMs: result.durationMs },
+      })
       return
     }
 

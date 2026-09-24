@@ -18,10 +18,13 @@
 | **额度查询** | 剩余 / 已用 / 总额度，是否超额 |
 | **每日自动签到** | 每天 10:00 后随机时刻领取 100 Credits（官方每日 10:00 UTC+8 刷新） |
 | **手动签到** | `POST /signin/claim` 立即执行，幂等安全 |
+| **模型推理** | `POST /v1/chat/completions`（OpenAI 兼容），经官方 qodercli 子进程执行 |
 
-> **它不做什么**：Qoder 的模型推理**不是公开 REST 接口**（`/v1/chat/completions` 在两个
-> 网关上都是 404），而是走 CLI 的 SDK 私协议。因此本项目**不提供** OpenAI / Anthropic
-> 兼容的推理入口，只做账号与签到管理。
+> **推理是怎么实现的**：Qoder 的模型推理**不是公开 REST 接口**（`/v1/chat/completions`
+> 在两个网关上都是 404）。官方为自动化场景提供了 **Agent SDK + 独立 CLI**
+> （`@qoder-ai/qodercli`），推理在本地 `qodercli` 子进程内完成。
+> 本项目据此把 CLI 包成 OpenAI 兼容入口，**不逆向任何私有协议**。
+> 详见 [模型推理](#模型推理)。
 
 ---
 
@@ -60,13 +63,74 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
 | `GET` | `/usage?region=cn` | 单区域额度与套餐明细 |
 | `GET` | `/signin` | 签到状态（可领项、今日是否已领） |
 | `POST` | `/signin/claim` | 立即签到（默认全部区域，可用 `?region=` 限定） |
+| `GET` | `/cli/status` | qodercli 安装/登录/可用模型/并发占用 |
+| `POST` | `/v1/chat/completions` | OpenAI 兼容推理入口 |
 
 示例：
 
 ```bash
+# 管理面
 curl http://127.0.0.1:39320/status
 curl -X POST "http://127.0.0.1:39320/signin/claim?region=cn"
+
+# 推理面
+curl http://127.0.0.1:39320/cli/status
+curl -X POST http://127.0.0.1:39320/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"auto","messages":[{"role":"user","content":"用一句话说明什么是递归"}]}'
 ```
+
+---
+
+## 模型推理
+
+推理走**官方 qodercli 子进程**，不是 REST 转发（Qoder 的推理端点不对外公开）。
+
+### 一次性准备
+
+```powershell
+# 1. 装内嵌运行时（68MB，落在 vendor/，不进版本库）
+cd vendor
+npm install
+
+# 2. 登录一次（会打开浏览器 OAuth）
+powershell -ExecutionPolicy Bypass -File scripts\login-qodercli.ps1
+```
+
+登录态由 qodercli 自己保管（`--config-dir` 可指向独立配置目录做多账号隔离），
+本项目**不接触**该凭据。
+
+### 调用形态
+
+```jsonc
+POST /v1/chat/completions
+{
+  "model": "auto",              // 可选：auto / performance / efficient / lite
+  "messages": [                 // OpenAI 风格；system/assistant 会被拼成角色标注文本
+    { "role": "system", "content": "你是一个简洁的助手" },
+    { "role": "user", "content": "什么是递归？" }
+  ]
+}
+```
+
+响应是标准 OpenAI `chat.completion` 结构，另附 `qoder.durationMs` 供观测。
+
+### 关键设计与约束
+
+| 项 | 取值 | 原因 |
+|---|---|---|
+| 每次请求 | **一个短命子进程** | 官方明确「一个本地 session 由一个 qodercli 进程独占」 |
+| 工具集 | `--tools ""` **全部禁用** | 使其退化为纯对话，不读文件、不跑命令 |
+| 权限模式 | `--permission-mode dont_ask` | 无人值守，不做交互确认 |
+| 会话持久化 | 关闭 | 避免磁盘堆积 |
+| 并发 | **默认 2**（`QODER_CLI_MAX_CONCURRENCY`） | 每个进程约 100–200MB，开大易爆内存 |
+| 超时 | **默认 180s**（`QODER_CLI_TIMEOUT_MS`） | CLI 要起进程 + 握手 + 推理 |
+
+> **流式（`stream: true`）暂不支持**——当前实现在子进程退出后一次性返回。
+> 需要真流式时应改用 SDK 的消息迭代器（`query()` 的 `for await`），而非 CLI `-p`。
+
+> **性能预期**：每个请求都要付「起进程 + 握手」的固定开销，因此**单次延迟明显高于
+> 纯 REST 代理**，不适合高频小请求。这是子进程架构的固有代价。
 
 ---
 
@@ -159,11 +223,13 @@ qoder-proxy/
 │   ├── upstream.ts    Qoder 上游 HTTP 客户端（账号/套餐/额度/活动/领取）
 │   ├── signin.ts      签到适配层（状态判定 + 领取语义）
 │   ├── scheduler.ts   每日随机时刻调度器（与其它代理共用）
-│   ├── serve.ts       HTTP 管理服务
+│   ├── cli.ts         qodercli 子进程驱动（推理面）
+│   ├── serve.ts       HTTP 管理 + 推理服务
 │   ├── main.ts        进程入口（服务 + 调度）
 │   └── version.ts     版本号
-├── scripts/           start / stop / status / install-autostart / uninstall-autostart
-├── test/              单元测试（40 项）
+├── scripts/           start / stop / status / login-qodercli / install-autostart / uninstall-autostart
+├── vendor/            内嵌 qodercli 运行时（node_modules 不入库）
+├── test/              单元测试（46 项）
 └── state/             签到计划持久化（运行时生成）
 ```
 
@@ -172,10 +238,11 @@ qoder-proxy/
 ## 测试
 
 ```powershell
-node --test test/signin.test.ts test/auth-scheduler.test.ts test/crypto-upstream.test.ts
+node --test test/signin.test.ts test/auth-scheduler.test.ts test/crypto-upstream.test.ts test/cli.test.ts
 ```
 
 全部离线：加解密用自造密钥与临时文件，上游解析用假 `fetch`，
+CLI 层只测可确定的纯逻辑（不启动真实进程），
 **不触碰真实的 `auth.v1.dat`**。
 
 ---
@@ -190,12 +257,19 @@ node --test test/signin.test.ts test/auth-scheduler.test.ts test/crypto-upstream
 | `QODER_USER_DATA` / `QODER_CN_USER_DATA` | 自动探测 | 覆盖 Electron userData 目录 |
 | `QODER_HOME` / `QODER_CN_HOME` | 自动探测 | 覆盖 `~/.qoder` 目录 |
 | `QODER_OPENAPI` / `QODER_CN_OPENAPI` | 官方域名 | 覆盖上游 API 域名 |
+| `QODER_CLI_ENTRY` | 内嵌 vendor | 覆盖 qodercli 可执行入口（自管运行时） |
+| `QODER_CLI_CONFIG_DIR` | CLI 默认 | 传 `--config-dir`，用于多账号配置隔离 |
+| `QODER_CLI_MAX_CONCURRENCY` | `2` | 同时在跑的 qodercli 进程上限 |
+| `QODER_CLI_TIMEOUT_MS` | `180000` | 单次推理超时 |
 
 ---
 
 ## 已知限制
 
-- **不支持模型推理**：Qoder 推理走 CLI 私协议，不是公开 REST。
+- **流式输出未实现**：`stream: true` 会被忽略，响应一次性返回。需要真流式须改用 SDK 消息迭代器。
+- **单次延迟偏高**：每个请求一个子进程，需付「起进程 + 握手」固定开销，不适合高频小请求。
+- **推理凭据独立**：推理用 qodercli 自己的登录态（`qodercli login`），与桌面端
+  `auth.v1.dat` 是两套体系——桌面端令牌可用于签到，但**不能**直接驱动 CLI 推理。
 - **单账号 per 区域**：桌面端同一区域只保留一份登录态，多账号需在客户端手动切换。
 - **依赖桌面端登录**：令牌过期后需在 Qoder 客户端重新登录；本项目不做自动刷新
   （刷新令牌虽已读出，但主动刷新容易被风控识别，故不实现）。
@@ -204,4 +278,4 @@ node --test test/signin.test.ts test/auth-scheduler.test.ts test/crypto-upstream
 
 ## 版本
 
-当前 `0.1.0`。发布规则：只 bump PATCH。
+当前 `0.1.3`。发布规则：只 bump PATCH。

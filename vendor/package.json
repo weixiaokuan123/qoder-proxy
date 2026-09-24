@@ -1,0 +1,9 @@
+{
+  "name": "qoder-proxy-vendor",
+  "private": true,
+  "version": "1.0.0",
+  "description": "qoder-proxy 内嵌的官方 qodercli 运行时。运行 `npm install` 获取；node_modules 不入版本库。",
+  "dependencies": {
+    "@qoder-ai/qodercli": "^1.1.63"
+  }
+}
