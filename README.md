@@ -36,9 +36,17 @@ powershell -ExecutionPolicy Bypass -File scripts\status.ps1
 
 # 停止
 powershell -ExecutionPolicy Bypass -File scripts\stop.ps1
+
+# 注册「登录时静默自启」（可选，推荐）
+powershell -ExecutionPolicy Bypass -File scripts\install-autostart.ps1
+# 取消自启
+powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
 ```
 
 服务监听 `http://127.0.0.1:39320`。
+
+> 自启通过计划任务（`qoder-proxy-autostart`，触发器为当前用户登录）调用一个隐藏窗口的
+> `.vbs`，因此不会弹出控制台窗口。注册后重启电脑也会自动常驻。
 
 ---
 
@@ -154,7 +162,7 @@ qoder-proxy/
 │   ├── serve.ts       HTTP 管理服务
 │   ├── main.ts        进程入口（服务 + 调度）
 │   └── version.ts     版本号
-├── scripts/           start / stop / status
+├── scripts/           start / stop / status / install-autostart / uninstall-autostart
 ├── test/              单元测试（40 项）
 └── state/             签到计划持久化（运行时生成）
 ```
