@@ -64,7 +64,8 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
 | `GET` | `/signin` | 签到状态（可领项、今日是否已领） |
 | `POST` | `/signin/claim` | 立即签到（默认全部区域，可用 `?region=` 限定） |
 | `GET` | `/cli/status` | qodercli 安装/登录/可用模型/并发占用 |
-| `POST` | `/v1/chat/completions` | OpenAI 兼容推理入口 |
+| `GET` | `/v1/models` | 模型发现（OpenAI 风格列表，17 个） |
+| `POST` | `/v1/chat/completions` | OpenAI 兼容推理入口（`stream: true` 走 SSE 回放） |
 
 示例：
 
@@ -126,8 +127,11 @@ POST /v1/chat/completions
 | 并发 | **默认 2**（`QODER_CLI_MAX_CONCURRENCY`） | 每个进程约 100–200MB，开大易爆内存 |
 | 超时 | **默认 180s**（`QODER_CLI_TIMEOUT_MS`） | CLI 要起进程 + 握手 + 推理 |
 
-> **流式（`stream: true`）暂不支持**——当前实现在子进程退出后一次性返回。
-> 需要真流式时应改用 SDK 的消息迭代器（`query()` 的 `for await`），而非 CLI `-p`。
+> **流式输出是「回放式」的**：qodercli 的 `-p` 模式不产生 token 级增量（assistant
+> 文本整块一次到达），所以 `stream: true` 会在拿到完整结果后，按 OpenAI SSE 协议
+> **回放**成分片 chunk——协议上与真流式无异，客户端可正常逐块消费，但**延迟收益为零**
+> （总耗时仍由子进程决定）。需要真·增量流式须改用 SDK 的消息迭代器
+> （`query()` 的 `for await`），而非 CLI `-p`。
 
 > **性能预期**：每个请求都要付「起进程 + 握手」的固定开销，因此**单次延迟明显高于
 > 纯 REST 代理**，不适合高频小请求。这是子进程架构的固有代价。
@@ -277,7 +281,8 @@ CLI 层只测可确定的纯逻辑（不启动真实进程），
 
 ## 已知限制
 
-- **流式输出未实现**：`stream: true` 会被忽略，响应一次性返回。需要真流式须改用 SDK 消息迭代器。
+- **流式为回放式**：`stream: true` 走 SSE 协议，但在子进程完成推理后才开始回放，
+  无增量延迟收益（CLI `-p` 不吐 token 级增量）。真流式须改用 Agent SDK 迭代器。
 - **单次延迟偏高**：每个请求一个子进程，需付「起进程 + 握手」固定开销，不适合高频小请求。
 - **推理凭据独立**：推理用 qodercli 自己的登录态（`qodercli login`），与桌面端
   `auth.v1.dat` 是两套体系——桌面端令牌可用于签到，但**不能**直接驱动 CLI 推理。
@@ -289,4 +294,4 @@ CLI 层只测可确定的纯逻辑（不启动真实进程），
 
 ## 版本
 
-当前 `0.1.3`。发布规则：只 bump PATCH。
+当前 `0.1.4`。发布规则：只 bump PATCH。

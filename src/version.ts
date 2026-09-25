@@ -10,4 +10,4 @@
  * 发布规则：只 bump PATCH，不 bump MINOR/MAJOR。
  */
 
-export const QODER_PROXY_VERSION = '0.1.3'
+export const QODER_PROXY_VERSION = '0.1.4'

@@ -13,7 +13,8 @@
  * 推理面（走官方 qodercli 子进程，见 src/cli.ts）：
  *
  *   GET  /cli/status                 qodercli 安装/登录/可用模型/并发占用
- *   POST /v1/chat/completions        OpenAI 兼容推理入口
+ *   GET  /v1/models                  模型发现（OpenAI 风格列表）
+ *   POST /v1/chat/completions        OpenAI 兼容推理入口（支持 stream: true 的 SSE 回放）
  *
  * 账号来源是**桌面端登录态**（只读 `auth.v1.dat`），不做账号池、不做端口分账号
  * —— Qoder 桌面端同一区域只保留一份登录态，多账号需要用户自行在客户端切换。
@@ -171,6 +172,66 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'Cache-Control': 'no-store',
   })
   res.end(text)
+}
+
+/** 官方 CLI `--list-models` 暴露的模型清单（去掉表头），供 /v1/models 发现用。 */
+export const KNOWN_CLI_MODELS: readonly string[] = [
+  'Auto', 'Ultimate', 'Performance', 'Efficient', 'Sonus', 'Cantus',
+  'Qwen3.8-Max', 'Qwen3.8-Flash', 'Qwen3.7-Max', 'Qwen3.7-Plus',
+  'Kimi-K3', 'Kimi-K2.8-Preview', 'GLM-5.3', 'GLM-5.3-Flash',
+  'DeepSeek-V4-Pro', 'DeepSeek-Flash', 'MiniMax-M3',
+]
+
+interface SseUsage {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+}
+
+/**
+ * 以 OpenAI SSE 流协议回放一段完整文本。
+ *
+ * qodercli 的 `-p` 模式不产生 token 级增量（assistant 文本整块一次到达），
+ * 因此这里在拿到完整结果后**回放**成分片 chunk——协议上与真流式无异，
+ * 客户端（如 opencode）能正常逐块消费，但延迟收益为零（总耗时仍由 CLI 决定）。
+ *
+ * 必须在调用成功后才调用：一旦 writeHead 就无法再返回 502。
+ */
+function sendSseChatCompletion(
+  res: ServerResponse,
+  opts: { id: string; created: number; model: string; text: string; usage: SseUsage },
+): void {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  })
+
+  const chunk = (delta: Record<string, unknown>, finish: string | null, usage?: SseUsage): string => {
+    const payload: Record<string, unknown> = {
+      id: opts.id,
+      object: 'chat.completion.chunk',
+      created: opts.created,
+      model: opts.model,
+      choices: [{ index: 0, delta, finish_reason: finish }],
+    }
+    if (usage !== undefined) payload['usage'] = usage
+    return `data: ${JSON.stringify(payload)}\n\n`
+  }
+
+  // 首块声明角色
+  res.write(chunk({ role: 'assistant', content: '' }, null))
+
+  // 内容分片回放
+  const PIECE = 48
+  for (let i = 0; i < opts.text.length; i += PIECE) {
+    res.write(chunk({ content: opts.text.slice(i, i + PIECE) }, null))
+  }
+
+  res.write(chunk({}, 'stop', opts.usage))
+  res.write('data: [DONE]\n\n')
+  res.end()
 }
 
 /** 读取并解析请求体（限 1MB）。 */
@@ -409,10 +470,12 @@ export async function startServer(options: ServeOptions = {}): Promise<{ port: n
       }
 
       const model = typeof body['model'] === 'string' && body['model'] !== '' ? body['model'] : undefined
+      const wantStream = body['stream'] === true
       const result = await runCli({ prompt, ...(model !== undefined ? { model } : {}) })
 
       const created = Math.floor(Date.now() / 1000)
       if (!result.ok) {
+        // 尚未写响应头，两种模式都能干净地返回 502
         sendJson(res, 502, {
           error: { message: result.error ?? 'qodercli 调用失败', type: 'upstream_error' },
           qoder: { durationMs: result.durationMs, timedOut: result.timedOut, code: result.code },
@@ -420,11 +483,24 @@ export async function startServer(options: ServeOptions = {}): Promise<{ port: n
         return
       }
 
+      const id = `chatcmpl-qoder-${created}-${Math.random().toString(36).slice(2, 10)}`
+      const responseModel = model ?? 'qoder-auto'
+      const usage: SseUsage = {
+        prompt_tokens: Math.ceil(prompt.length / 4),
+        completion_tokens: Math.ceil(result.text.length / 4),
+        total_tokens: Math.ceil((prompt.length + result.text.length) / 4),
+      }
+
+      if (wantStream) {
+        sendSseChatCompletion(res, { id, created, model: responseModel, text: result.text, usage })
+        return
+      }
+
       sendJson(res, 200, {
-        id: `chatcmpl-qoder-${created}-${Math.random().toString(36).slice(2, 10)}`,
+        id,
         object: 'chat.completion',
         created,
-        model: model ?? 'qoder-auto',
+        model: responseModel,
         choices: [
           {
             index: 0,
@@ -432,12 +508,16 @@ export async function startServer(options: ServeOptions = {}): Promise<{ port: n
             finish_reason: 'stop',
           },
         ],
-        usage: {
-          prompt_tokens: Math.ceil(prompt.length / 4),
-          completion_tokens: Math.ceil(result.text.length / 4),
-          total_tokens: Math.ceil((prompt.length + result.text.length) / 4),
-        },
+        usage,
         qoder: { durationMs: result.durationMs },
+      })
+      return
+    }
+
+    if (path === '/v1/models' && (req.method === 'GET' || req.method === 'HEAD')) {
+      sendJson(res, 200, {
+        object: 'list',
+        data: KNOWN_CLI_MODELS.map((id) => ({ id, object: 'model', owned_by: 'qoder' })),
       })
       return
     }
