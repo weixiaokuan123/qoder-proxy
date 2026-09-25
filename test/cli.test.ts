@@ -86,31 +86,57 @@ test('runCli 失败后并发闸门不泄漏', async () => {
 
 // --- isStatusLoggedIn：登录态判定 ---
 
-test('isStatusLoggedIn：未登录输出判为 false', () => {
-  assert.equal(isStatusLoggedIn('Version: 1.1.63\nAccount: Not logged in'), false)
+// 未登录的真实输出
+const NOT_LOGGED_IN = 'Version: 1.1.63\nAccount: Not logged in';
+
+// 已登录的真实输出（实测，注意没有 Account 行）
+const LOGGED_IN = [
+  'Version: 1.1.63',
+  'Username: efficient dignified',
+  'Email: endlessworld17@gmail.com',
+  'Avatar: https://qoder.com/users/01a0d2aa/default/avatars',
+  'Login Method: browser',
+  'Auth Source: local',
+].join('\n');
+
+test('isStatusLoggedIn：真实未登录输出判为 false', () => {
+  assert.equal(isStatusLoggedIn(NOT_LOGGED_IN), false);
 })
 
-test('isStatusLoggedIn：邮箱 / 手机判为已登录', () => {
-  assert.equal(isStatusLoggedIn('Version: 1.1.63\nAccount: user@example.com'), true)
-  assert.equal(isStatusLoggedIn('Version: 1.1.63\nAccount: 17823437854'), true)
+test('isStatusLoggedIn：真实已登录输出判为 true（无 Account 行）', () => {
+  assert.equal(isStatusLoggedIn(LOGGED_IN), true);
+})
+
+test('isStatusLoggedIn：仅有 Email 也算已登录', () => {
+  assert.equal(isStatusLoggedIn('Version: 1.1.63\nEmail: a@b.com'), true);
+})
+
+test('isStatusLoggedIn：仅有 Username 也算已登录', () => {
+  assert.equal(isStatusLoggedIn('Version: 1.1.63\nUsername: someone'), true);
+})
+
+test('isStatusLoggedIn：空值行不误判为已登录', () => {
+  assert.equal(isStatusLoggedIn('Version: 1.1.63\nUsername:\nEmail:'), false);
+  assert.equal(isStatusLoggedIn('Version: 1.1.63\nUsername:   \nEmail:  '), false);
 })
 
 test('isStatusLoggedIn：未登录行后有其它输出仍判为 false', () => {
-  assert.equal(isStatusLoggedIn('Version: 1.1.63\nAccount: Not logged in\nExtra'), false)
+  assert.equal(isStatusLoggedIn('Version: 1.1.63\nAccount: Not logged in\nExtra'), false);
 })
 
-test('isStatusLoggedIn：缺少 Account 行判为 false', () => {
-  assert.equal(isStatusLoggedIn('Version: 1.1.63'), false)
-  assert.equal(isStatusLoggedIn(''), false)
+test('isStatusLoggedIn：缺少账号行判为 false', () => {
+  assert.equal(isStatusLoggedIn('Version: 1.1.63'), false);
+  assert.equal(isStatusLoggedIn(''), false);
 })
 
 test('isStatusLoggedIn：空值与仅空白判为 false', () => {
-  assert.equal(isStatusLoggedIn('Account:'), false)
-  assert.equal(isStatusLoggedIn('Account:   '), false)
-  assert.equal(isStatusLoggedIn('Account: Not logged in '), false)
+  assert.equal(isStatusLoggedIn('Account:'), false);
+  assert.equal(isStatusLoggedIn('Account:   '), false);
+  assert.equal(isStatusLoggedIn('Account: Not logged in '), false);
 })
 
 test('isStatusLoggedIn：大小写不敏感', () => {
-  assert.equal(isStatusLoggedIn('account: NOT LOGGED IN'), false)
-  assert.equal(isStatusLoggedIn('ACCOUNT: someone@x.com'), true)
+  assert.equal(isStatusLoggedIn('account: NOT LOGGED IN'), false);
+  assert.equal(isStatusLoggedIn('username: someone'), true);
+  assert.equal(isStatusLoggedIn('EMAIL: someone@x.com'), true);
 })

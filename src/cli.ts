@@ -305,17 +305,39 @@ export interface CliProbeResult {
 /**
  * 解析 `qodercli status` 的输出，判断是否已登录。
  *
- * 未登录时输出形如 `Account: Not logged in`；已登录时为账号标识（邮箱/手机）。
+ * 两种实际输出形态（实测）：
+ *   未登录：`Version: x` + `Account: Not logged in`
+ *   已登录：`Version: x` + `Username: ...` + `Email: ...` + `Login Method: browser` + `Auth Source: local`
+ *
+ * 因此不能只找 `Account:` —— 已登录时没有这一行。改为：
+ * 出现账号标识行（Username / Email）即视为已登录；仅有 `Account:` 时按其取值判断。
  * 导出以便单测覆盖各种边角输入。
  */
 export function isStatusLoggedIn(statusText: string): boolean {
-  const line = statusText
+  const lines = statusText
     .split(/\r?\n/)
     .map((l) => l.trim())
-    .find((l) => l.toLowerCase().startsWith('account:'));
-  if (!line) return false;
-  const value = line.slice('account:'.length).trim();
-  return value.length > 0 && value.toLowerCase() !== 'not logged in';
+    .filter(Boolean);
+
+  const valueOf = (key: string): string | null => {
+    const line = lines.find((l) => l.toLowerCase().startsWith(`${key}:`));
+    if (!line) return null;
+    return line.slice(key.length + 1).trim();
+  };
+
+  // 已登录的标志：有 Username 或 Email 且非空
+  for (const key of ['username', 'email']) {
+    const v = valueOf(key);
+    if (v !== null && v.length > 0) return true;
+  }
+
+  // 退化情形：只有 Account 行
+  const account = valueOf('account');
+  if (account !== null) {
+    return account.length > 0 && account.toLowerCase() !== 'not logged in';
+  }
+
+  return false;
 }
 
 export async function probeCli(): Promise<CliProbeResult> {
